@@ -6,7 +6,7 @@ from concurrent.futures import ALL_COMPLETED, Future, ThreadPoolExecutor, wait
 from enum import Enum
 from typing import List, Optional, Tuple, Type
 
-from bfcl_eval.constants.eval_config import DOTENV_PATH
+from bfcl_eval.constants.eval_config import DOTENV_PATH, PROJECT_ROOT
 from dotenv import load_dotenv
 from openai import OpenAI
 from openai.types.responses import ParsedResponse, Response
@@ -14,6 +14,8 @@ from pydantic import BaseModel, Field
 from utils import with_spinner
 
 load_dotenv(dotenv_path=DOTENV_PATH, verbose=True, override=True)  # Load the .env file
+
+WEB_ROOT = PROJECT_ROOT / "bfcl_web"
 
 MODEL = "o3"
 WEB_SEARCH = True
@@ -28,7 +30,7 @@ COSTS = {
     "gpt-4o": {"input": 2.50, "output": 10.00},
 }
 
-with open("prompts.json", "r") as f:
+with open(WEB_ROOT / "prompts.json", "r") as f:
     PROMPTS = json.load(f)
 
 
@@ -51,35 +53,35 @@ class ConfidenceLevel(str, Enum):
 class PuzzleGuess(BaseModel):
     confidence: ConfidenceLevel
     guess: str
+    process: str
 
 
 class PuzzleRefinement(BaseModel):
     version: int
     puzzle: str
     response_id: str = Field(exclude=True)
+    refinement_process: str
     guess: Optional[str] = None
     confidence: Optional[ConfidenceLevel] = None
-
-    def __str__(self):
-        return f"Puzzle: {self.puzzle}"
+    solving_process: Optional[str] = None
 
 
 class Puzzle(BaseModel):
     timestamp: str = Field(default_factory=lambda: datetime.datetime.now().isoformat())
     model: str = MODEL
     answer: str
+    final_puzzle: Optional[str] = None
     original_facts: List[CreatedFact] = Field(default_factory=list)
     revised_facts: List[CreatedFact] = Field(default_factory=list)
-    final_puzzle: Optional[str] = None
     refinements: List[PuzzleRefinement] = Field(default_factory=list)
     total_cost: float = 0.0
+    puzzle_creation_chat_history: List = Field(default_factory=list, exclude=True)
 
 
 @with_spinner()
 def get_response(
-    system: str,
-    prompt: str,
-    user: Optional[object] = None,
+    developer: str,
+    prompt,
     prev_resp_id: Optional[str] = None,
     schema: Optional[Type[BaseModel]] = None,
 ) -> ParsedResponse:
@@ -87,9 +89,8 @@ def get_response(
     Get a response from the OpenAI API.
 
     Args:
-        system: The system message
+        developer: The developer message
         prompt: The prompt to send to the API
-        user: Optional user input to format into the prompt
         prev_resp_id: Optional previous response ID for follow-up queries
         schema: Optional Pydantic model to parse the response into
 
@@ -102,9 +103,10 @@ def get_response(
 
     kwargs = {
         "model": MODEL,
-        "instructions": system,
-        "input": prompt.format(user) if user else prompt,
+        "instructions": developer,
+        "input": prompt,
         "tools": tools,
+        "include": ["reasoning.encrypted_content"],
         "reasoning": {"summary": "auto"},
     }
 
@@ -155,9 +157,8 @@ def create_single_fact(answer: str) -> Optional[Tuple[CreatedFact, float]]:
         A tuple of (fact, cost) if successful, None otherwise
     """
     response: ParsedResponse[CreatedFact] = get_response(
-        PROMPTS["fact_finder"]["system"],
-        PROMPTS["fact_finder"]["user"],
-        answer,
+        developer=PROMPTS["fact_finder"]["developer"],
+        prompt=PROMPTS["fact_finder"]["user"].format(answer),
         schema=CreatedFact,
     )
 
@@ -219,12 +220,11 @@ def create_facts_parallel(answer: str, puzzle: Puzzle) -> None:
     )
 
 
-def create_fact(answer: str, puzzle: Puzzle) -> None:
+def _create_fact(answer: str, puzzle: Puzzle) -> None:
     """Create a fact about the answer and add it to the puzzle."""
     response: ParsedResponse[CreatedFact] = get_response(
-        PROMPTS["fact_finder"]["system"],
-        PROMPTS["fact_finder"]["user"],
-        answer,
+        developer=PROMPTS["fact_finder"]["developer"],
+        prompt=PROMPTS["fact_finder"]["user"].format(answer),
         schema=CreatedFact,
     )
     fact = response.output_parsed
@@ -237,12 +237,11 @@ def create_fact(answer: str, puzzle: Puzzle) -> None:
     # TODO: Do I want to include their reasoning process somewhere?
 
 
-def rephrase_fact(fact: CreatedFact, puzzle: Puzzle) -> CreatedFact:
+def _rephrase_fact(fact: CreatedFact, puzzle: Puzzle) -> CreatedFact:
     """Rephrase a fact and add it to the puzzle."""
     response: ParsedResponse[CreatedFact] = get_response(
-        PROMPTS["rephraser"]["system"],
-        PROMPTS["rephraser"]["user"],
-        fact,
+        developer=PROMPTS["rephraser"]["developer"],
+        prompt=PROMPTS["rephraser"]["user"].format(fact),
         schema=CreatedFact,
     )
     revised_fact = response.output_parsed
@@ -258,16 +257,35 @@ def rephrase_fact(fact: CreatedFact, puzzle: Puzzle) -> CreatedFact:
 
 def create_puzzle(puzzle: Puzzle) -> None:
     # Format facts for the puzzle creation
-    facts_text = "FACTS:\n"
-    for i, fact in enumerate(puzzle.revised_facts, 1):
+    facts_text = ""
+    for i, fact in enumerate(puzzle.original_facts, 1):
         facts_text += f"{i}. {fact.fact}\n"
 
-    response = get_response(
-        PROMPTS["create_puzzle"]["system"], PROMPTS["create_puzzle"]["user"], facts_text
+    developer = PROMPTS["create_puzzle"]["developer"]
+    prompt = PROMPTS["create_puzzle"]["user"].format(facts_text)
+
+    print("Creating puzzle...")
+
+    response = get_response(developer=developer, prompt=prompt)
+
+    puzzle.puzzle_creation_chat_history.extend(
+        [
+            {"role": "developer", "content": developer},
+            {"role": "user", "content": prompt},
+        ]
     )
+
+    reasoning = get_reasoning(response)
+
+    print("Reasoning: ", reasoning)
+    print("Created puzzle:", response.output_text)
+
     puzzle.refinements.append(
         PuzzleRefinement(
-            version=0, puzzle=response.output_text, response_id=response.id
+            version=0,
+            puzzle=response.output_text,
+            response_id=response.id,
+            refinement_process=reasoning,
         )
     )
 
@@ -275,37 +293,67 @@ def create_puzzle(puzzle: Puzzle) -> None:
 
 
 def solve_puzzle(puzzle: Puzzle) -> ConfidenceLevel | None:
+    developer = PROMPTS["solve_puzzle"]["developer"]
+    prompt: str = PROMPTS["solve_puzzle"]["user"].format(puzzle.refinements[-1].puzzle)
+
+    print("Solving puzzle...")
+
     response: ParsedResponse[PuzzleGuess] = get_response(
-        PROMPTS["solve_puzzle"]["system"],
-        PROMPTS["solve_puzzle"]["user"],
-        puzzle.refinements[-1],
+        developer=developer,
+        prompt=prompt,
         schema=PuzzleGuess,
     )
+
+    puzzle.puzzle_creation_chat_history.extend(
+        [
+            {"role": "developer", "content": developer},
+            {"role": "user", "content": prompt},
+        ]
+    )
+    puzzle.puzzle_creation_chat_history.extend(response.output)
+
+    reasoning = get_reasoning(response)
+    print("Reasoning:", reasoning)
+
     puzzle_guess = response.output_parsed
     if puzzle_guess:
+        print("Puzzle guess:", puzzle_guess)
         recent_puzzle = puzzle.refinements[-1]
         recent_puzzle.confidence = puzzle_guess.confidence
         recent_puzzle.guess = puzzle_guess.guess
+        recent_puzzle.solving_process = puzzle_guess.process
 
         puzzle.total_cost += get_costs(response)
         return puzzle_guess.confidence
 
 
 def refine_puzzle(puzzle: Puzzle) -> None:
-    text = f"{puzzle.refinements[-1].confidence} - {puzzle.refinements[-1].guess}"
+    developer = PROMPTS["refine_puzzle"]["developer"]
+    prompt = PROMPTS["refine_puzzle"]["user"].format(f"""
+        Guess: {puzzle.refinements[-1].guess}
+        Confidence: {puzzle.refinements[-1].confidence}
+        Solving Process: {puzzle.refinements[-1].solving_process}
+        Correct Answer: {puzzle.answer}
+    """)
+    puzzle.puzzle_creation_chat_history.append({"role": "user", "content": prompt})
+
+    print("Refining puzzle...")
+
     response = get_response(
-        PROMPTS["refine_puzzle"]["system"],
-        PROMPTS["refine_puzzle"]["user"],
-        text,
-        prev_resp_id=puzzle.refinements[-1].response_id,
+        developer=developer, prompt=puzzle.puzzle_creation_chat_history
     )
     puzzle.refinements.append(
         PuzzleRefinement(
             version=len(puzzle.refinements),
             puzzle=response.output_text,
             response_id=response.id,
+            refinement_process=get_reasoning(response),
         )
     )
+
+    reasoning = get_reasoning(response)
+    print("Reasoning:", reasoning)
+    print("Refined puzzle:", response.output_text)
 
     puzzle.total_cost += get_costs(response)
 
@@ -315,8 +363,8 @@ def create_puzzle_for_answer(answer: str):
 
     create_facts_parallel(answer, puzzle)
 
-    for fact in puzzle.original_facts:
-        rephrase_fact(fact, puzzle)
+    # for fact in puzzle.original_facts:
+    #     rephrase_fact(fact, puzzle)
 
     create_puzzle(puzzle)
 
@@ -345,7 +393,7 @@ def create_puzzle_for_answer(answer: str):
     print(f"Final puzzle for {puzzle.answer}: {puzzle.final_puzzle}")
 
     # Append to output JSON
-    output_filename = "puzzle_outputs.json"
+    output_filename = WEB_ROOT / "puzzle_outputs.json"
 
     try:
         with open(output_filename, "r") as f:
@@ -368,12 +416,12 @@ def create_puzzle_for_answer(answer: str):
 
 def main():
     # Read answers from file
-    with open("answers.txt", "r") as f:
+    with open(WEB_ROOT / "answers.txt", "r") as f:
         answers = [line.strip() for line in f if line.strip()]
 
     print(f"Found {len(answers)} answers in answers.txt.")
 
-    with open("puzzle_outputs.json", "r") as f:
+    with open(WEB_ROOT / "puzzle_outputs.json", "r") as f:
         existing_data = json.load(f)
         existing_answers = {entry.get("answer", "").lower() for entry in existing_data}
 
